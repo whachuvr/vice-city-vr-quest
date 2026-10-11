@@ -108,6 +108,14 @@ RenderTrackedHands(void)
 	   androidgame::VrCutsceneCameraActor() != nil)
 		return;
 
+	// On foot the real skinned player hands are the VR hands. Disable the
+	// standalone Quest hand meshes at the render entry point so there can never
+	// be a duplicate floating pair.
+	if((OculusVR::IsQuestFirstPersonOnFoot() &&
+	    androidgame::VrBodyIKEnabled()) ||
+	   (player->InVehicle() && androidgame::VrVehicleBodyIKEnabled()))
+		return;
+
 	const PadInput &input = GetPadInput();
 	static int poseState = -1;
 	const int currentPoseState =

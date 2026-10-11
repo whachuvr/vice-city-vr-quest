@@ -3,6 +3,7 @@
 #if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)
 
 #include "OculusVR.h"
+#include "VrBodyIK.h"
 
 #include "android.h"
 #include "Camera.h"
@@ -496,6 +497,13 @@ static bool gGripLock;
 static bool gRunWithoutLimits;
 static CVector gBodyForward(0.0f, 1.0f, 0.0f);
 static bool gBodyForwardValid;
+
+// Baked LEFT-hand weapon position from the LAST completed calibration
+// explicitly selected by the player. This is position-only and is not
+// interactive at runtime.
+// exactLeftCorrection=(0.0008,0.0344,0.0328)m
+static const CVector kBakedLeftWeaponDeltaLocal(
+	0.0008f, 0.0344f, 0.0328f);
 
 static bool gActiveFire;
 static int gActiveFireHand = -1;
@@ -1158,6 +1166,150 @@ FindHolsterPoint(int slot)
 	return -1;
 }
 
+static CVector
+WeaponMatrixToLocalVector(const CVector &world, const CMatrix &basis)
+{
+	return CVector(
+		DotProduct(world, basis.GetRight()),
+		DotProduct(world, basis.GetForward()),
+		DotProduct(world, basis.GetUp()));
+}
+
+static CVector
+WeaponMatrixFromLocalVector(const CVector &local, const CMatrix &basis)
+{
+	return basis.GetRight()*local.x +
+		basis.GetForward()*local.y +
+		basis.GetUp()*local.z;
+}
+
+static bool
+BuildLegacyTrackedWeaponHandBasis(int hand, CVector *position, CVector *right,
+	CVector *up, CVector *forward)
+{
+	if(hand < 0 || hand >= VR_HAND_COUNT || !position || !right || !up ||
+	   !forward || !gPoseValid[hand])
+		return false;
+
+	*position = gGripMatrix[hand].GetPosition();
+	*forward = gAimMatrix[hand].GetForward();
+	if(forward->MagnitudeSqr() < 0.0001f)
+		return false;
+	forward->Normalise();
+
+	const int modelHand = 1-hand;
+	*up = gGripMatrix[hand].GetRight()*(modelHand == 0 ? 1.0f : -1.0f);
+	*up -= *forward*DotProduct(*up, *forward);
+	if(up->MagnitudeSqr() < 0.0001f)
+		return false;
+	up->Normalise();
+
+	*right = CrossProduct(*up, *forward);
+	if(right->MagnitudeSqr() < 0.0001f)
+		return false;
+	right->Normalise();
+
+	if(DotProduct(*right, gGripMatrix[hand].GetForward()) < 0.0f)
+		*right *= -1.0f;
+	return true;
+}
+
+static bool
+BuildLegacyWeaponModelMatrix(int hand, const WeaponCalibration &calibration,
+	CMatrix *matrix)
+{
+	if(!matrix)
+		return false;
+
+	CVector position, right, up, forward;
+	if(!BuildLegacyTrackedWeaponHandBasis(
+	   hand, &position, &right, &up, &forward))
+		return false;
+
+	matrix->SetUnity();
+	matrix->GetRight() = right*-1.0f;
+	matrix->GetForward() = forward*-1.0f;
+	matrix->GetUp() = up;
+	matrix->GetPosition() = position+
+		right*((float)calibration.offsetX/200.0f)+
+		forward*((float)calibration.offsetY/200.0f)+
+		up*((float)calibration.offsetZ/200.0f);
+
+	CMatrix base, rotationX, rotationY, rotationZ;
+	base.SetRotate(DEGTORAD(90.0f), 0.0f, DEGTORAD(-90.0f));
+	rotationX.SetRotateX(DEGTORAD((float)calibration.rotationX/
+		WEAPON_VALUE_SCALE));
+	rotationY.SetRotateY(DEGTORAD((float)calibration.rotationY/
+		WEAPON_VALUE_SCALE));
+	rotationZ.SetRotateZ(DEGTORAD((float)calibration.rotationZ/
+		WEAPON_VALUE_SCALE));
+
+	*matrix = *matrix*base*rotationX*rotationY*rotationZ;
+	return true;
+}
+
+static bool
+BuildLegacyAimNoTwoHand(int hand, const WeaponCalibration &calibration,
+	CVector *source, CVector *direction)
+{
+	if(!source || !direction || hand < 0 || hand >= VR_HAND_COUNT ||
+	   !gPoseValid[hand])
+		return false;
+
+	CVector right = gAimMatrix[hand].GetRight();
+	CVector up = gAimMatrix[hand].GetUp();
+	CVector forward = gAimMatrix[hand].GetForward();
+	if(right.MagnitudeSqr() < 0.0001f ||
+	   up.MagnitudeSqr() < 0.0001f ||
+	   forward.MagnitudeSqr() < 0.0001f)
+		return false;
+
+	forward.Normalise();
+	up -= forward*DotProduct(up, forward);
+	if(up.MagnitudeSqr() < 0.0001f)
+		return false;
+	up.Normalise();
+
+	// Preserve the exact original non-IK lateral axis behavior.
+	right -= forward*DotProduct(right, forward);
+	right -= up*DotProduct(right, up);
+	if(right.MagnitudeSqr() < 0.0001f)
+		return false;
+	right.Normalise();
+
+	const float pitch =
+		DEGTORAD((float)calibration.aimRotationX/WEAPON_VALUE_SCALE);
+	const float yaw =
+		DEGTORAD((float)calibration.aimRotationY/WEAPON_VALUE_SCALE);
+	const float roll =
+		DEGTORAD((float)calibration.aimRotationZ/WEAPON_VALUE_SCALE);
+
+	if(pitch != 0.0f){
+		forward = RotateAroundAxis(forward, right, pitch);
+		up = RotateAroundAxis(up, right, pitch);
+	}
+	if(yaw != 0.0f){
+		forward = RotateAroundAxis(forward, up, yaw);
+		right = RotateAroundAxis(right, up, yaw);
+	}
+	if(roll != 0.0f){
+		right = RotateAroundAxis(right, forward, roll);
+		up = RotateAroundAxis(up, forward, roll);
+	}
+
+	forward.Normalise();
+	*direction = forward;
+	*source = gAimMatrix[hand].GetPosition() +
+		right*((float)calibration.aimOffsetX/200.0f) +
+		up*((float)calibration.aimOffsetY/200.0f) +
+		forward*(0.18f+(float)calibration.aimOffsetZ/200.0f);
+	return true;
+}
+
+static bool BuildWeaponModelMatrixBase(
+	int hand, const WeaponCalibration &calibration, CMatrix *matrix);
+static void ApplyBakedLeftWeaponPosition(int hand, CMatrix *matrix);
+
 static bool
 BuildTrackedWeaponHandBasis(int hand, CVector *position, CVector *right,
 	CVector *up, CVector *forward)
@@ -1165,6 +1317,10 @@ BuildTrackedWeaponHandBasis(int hand, CVector *position, CVector *right,
 	if(hand < 0 || hand >= VR_HAND_COUNT || !position || !right || !up ||
 	   !forward || !gPoseValid[hand])
 		return false;
+	if(VrBodyIK::WeaponOwnershipActive() &&
+	   VrBodyIK::GetRigidWeaponHandBasis(
+		   hand, position, right, up, forward))
+		return true;
 	*position = gGripMatrix[hand].GetPosition();
 	*forward = gAimMatrix[hand].GetForward();
 	forward->Normalise();
@@ -1184,7 +1340,7 @@ BuildTrackedWeaponHandBasis(int hand, CVector *position, CVector *right,
 }
 
 static bool
-BuildWeaponModelMatrix(int hand, const WeaponCalibration &calibration,
+BuildWeaponModelMatrixBase(int hand, const WeaponCalibration &calibration,
 	CMatrix *matrix)
 {
 	if(!matrix)
@@ -1209,7 +1365,53 @@ BuildWeaponModelMatrix(int hand, const WeaponCalibration &calibration,
 	rotationZ.SetRotateZ(DEGTORAD((float)calibration.rotationZ/
 		WEAPON_VALUE_SCALE));
 	*matrix = *matrix*base*rotationX*rotationY*rotationZ;
+
+	if(VrBodyIK::WeaponOwnershipActive()){
+		// Preserve the exact pre-calibration v44 weapon behavior.
+		CVector barrel = matrix->GetRight();
+		if(barrel.MagnitudeSqr() > 0.0001f){
+			barrel.Normalise();
+			const float forwardOffset =
+				(hand == 0) ? 0.000f : 0.060f;
+			matrix->GetPosition() += barrel*forwardOffset;
+		}
+	}
 	return true;
+}
+
+static bool
+BuildWeaponModelMatrix(int hand, const WeaponCalibration &calibration,
+	CMatrix *matrix)
+{
+	if(!BuildWeaponModelMatrixBase(hand, calibration, matrix))
+		return false;
+
+	// Position-only baked LEFT-hand correction selected from the player's
+	// final completed calibration. No runtime calibration mode remains.
+	ApplyBakedLeftWeaponPosition(hand, matrix);
+	return true;
+}
+
+static CVector
+WeaponHandLocalToWorld(const CVector &local, const CVector &right,
+	const CVector &up, const CVector &forward)
+{
+	return right*local.x + forward*local.y + up*local.z;
+}
+
+static void
+ApplyBakedLeftWeaponPosition(int hand, CMatrix *matrix)
+{
+	if(!matrix || hand != 0)
+		return;
+
+	CVector handPosition, right, up, forward;
+	if(!BuildTrackedWeaponHandBasis(
+	   hand, &handPosition, &right, &up, &forward))
+		return;
+
+	matrix->GetPosition() += WeaponHandLocalToWorld(
+		kBakedLeftWeaponDeltaLocal, right, up, forward);
 }
 
 static bool
@@ -2247,6 +2449,42 @@ BuildAim(int hand, int weaponType, CVector *source, CVector *direction)
 		GetCalibration(hand, weaponType);
 	if(!calibration)
 		return false;
+
+	if(VrBodyIK::WeaponOwnershipActive()){
+		// Exact laser parity:
+		// 1) build the ORIGINAL non-IK gun transform
+		// 2) build the ORIGINAL non-IK aim ray
+		// 3) express that ray in the original gun's local coordinates
+		// 4) apply those SAME local coordinates to the final rigid IK gun
+		//
+		// This preserves the known-good non-IK laser-to-gun relationship
+		// exactly, regardless of IK-only tilt/forward/lateral presentation.
+		CMatrix legacyWeapon, finalWeapon;
+		CVector legacySource, legacyDirection;
+		if(!BuildLegacyWeaponModelMatrix(
+		   hand, *calibration, &legacyWeapon) ||
+		   !BuildLegacyAimNoTwoHand(
+		   hand, *calibration, &legacySource, &legacyDirection) ||
+		   !BuildWeaponModelMatrix(
+		   hand, *calibration, &finalWeapon))
+			return false;
+
+		CVector localSource = WeaponMatrixToLocalVector(
+			legacySource-legacyWeapon.GetPosition(), legacyWeapon);
+		CVector localDirection = WeaponMatrixToLocalVector(
+			legacyDirection, legacyWeapon);
+
+		*source = finalWeapon.GetPosition() +
+			WeaponMatrixFromLocalVector(localSource, finalWeapon);
+		*direction = WeaponMatrixFromLocalVector(
+			localDirection, finalWeapon);
+
+		if(direction->MagnitudeSqr() <= 0.0001f)
+			return false;
+		direction->Normalise();
+		return true;
+	}
+
 	CVector right = gAimMatrix[hand].GetRight();
 	CVector up = gAimMatrix[hand].GetUp();
 	CVector forward = gAimMatrix[hand].GetForward();
@@ -2521,7 +2759,8 @@ ApplyTouchInput(CControllerState *state)
 		// Rebuild the mapped buttons from the CONTROLS assignment without the
 		// triggers. The attack button of the current pad mode then belongs to
 		// the physically aimed weapon, whichever input reaches it.
-		androidgame::VrApplyPadBindings(state, input, false);
+		androidgame::PadInput mappedInput = input;
+		androidgame::VrApplyPadBindings(state, mappedInput, false);
 		if(padMode == 2)
 			state->Cross = 0;
 		if(padMode == 0 || padMode == 1)
@@ -2830,6 +3069,13 @@ bool IsTrackedWeaponHeld(int hand)
 }
 int GetHeldWeaponSlot(int hand) { return hand >= 0 && hand < VR_HAND_COUNT ? gHeldSlot[hand] : -1; }
 
+void
+ApplyBakedLeftWeaponPositionToMatrix(int hand, CMatrix *matrix)
+{
+	LoadSettings();
+	ApplyBakedLeftWeaponPosition(hand, matrix);
+}
+
 bool IsRunWithoutLimitsEnabled()
 {
 	LoadSettings();
@@ -2957,6 +3203,8 @@ bool
 ApplyTrackedWeaponTwoHandTransform(int hand, int weaponType,
 	CMatrix *matrix)
 {
+	if(VrBodyIK::WeaponOwnershipActive())
+		return false;
 	if(!matrix)
 		return false;
 	CVector pivot, axis;
@@ -3239,7 +3487,8 @@ GetQuestRawTrackedHandAimMatrix(int hand, CMatrix *matrix)
 
 static bool
 ApplyTwoHandVisualHandLock(int hand, CMatrix *handMatrix,
-	CVector *aimOrigin, CVector *aimDirection, float *grip, float *trigger)
+	CVector *aimOrigin, CVector *aimDirection, float *grip, float *trigger,
+	bool useCurrentWeaponSocket = false)
 {
 	if(hand < 0 || hand >= VR_HAND_COUNT)
 		return false;
@@ -3294,7 +3543,12 @@ ApplyTwoHandVisualHandLock(int hand, CMatrix *handMatrix,
 	if(hand != support || !BuildSupportVector(primary, weaponType,
 	   &rawPivot, &expected, &weaponRight, &weaponUp, &weaponForward))
 		return false;
-	if(angle != 0.0f){
+	// On the normal floating-hand path, rotate the support target by the
+	// same delta used for the primary weapon hand. Body IK has a second pass
+	// after solving the primary wrist; in that pass BuildSupportVector already
+	// describes the current rendered gun, so rotating this socket again would
+	// move the skinned hand away from the actual gun grip.
+	if(angle != 0.0f && !useCurrentWeaponSocket){
 		expected = RotateAroundAxis(expected, axis, angle);
 		weaponRight = RotateAroundAxis(weaponRight, axis, angle);
 		weaponUp = RotateAroundAxis(weaponUp, axis, angle);
@@ -3380,6 +3634,41 @@ ApplyTwoHandVisualHandLock(int hand, CMatrix *handMatrix,
 	if(trigger)
 		*trigger = gripType == SUPPORT_GRIP_FROM_BELOW ? 0.65f : 1.0f;
 	return true;
+}
+
+bool
+ApplyTrackedWeaponSupportHandLock(int hand, CMatrix *handMatrix,
+	bool useCurrentWeaponSocket)
+{
+	if(!handMatrix || hand < 0 || hand >= VR_HAND_COUNT)
+		return false;
+
+	// A two-handed weapon is one rigid visual assembly around the primary
+	// grip pivot. Body IK must rotate BOTH wrists from the same constraint:
+	// locking only the support wrist lets it sweep around the socket while the
+	// weapon stays aligned to the unrotated primary wrist. The primary branch
+	// rotates its basis about the same pivot, which carries the attached gun's
+	// front toward the support controller; the support branch places the offhand
+	// on the correspondingly rotated grip socket.
+	bool weaponHandActive = false;
+	for(int candidate = 0; candidate < VR_HAND_COUNT; candidate++){
+		const int slot = gHeldSlot[candidate];
+		const int support = gSupportHand[candidate];
+		if(slot < 0 || (candidate != hand && support != hand) ||
+		   support < 0 || support >= VR_HAND_COUNT || support == candidate)
+			continue;
+		const int weaponType = GetVrWeaponTypeForSlot(slot);
+		if(IsTwoHanded(weaponType)){
+			weaponHandActive = true;
+			break;
+		}
+	}
+	if(!weaponHandActive)
+		return false;
+
+	return ApplyTwoHandVisualHandLock(
+		hand, handMatrix, nil, nil, nil, nil,
+		useCurrentWeaponSocket);
 }
 
 bool

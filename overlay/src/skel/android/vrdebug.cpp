@@ -32,6 +32,7 @@
 #include "PointLights.h"
 #include "Timecycle.h"
 #include "VrRagdoll.h"
+#include "VrBodyIK.h"
 #include "VrCheatMenu.h"
 #include "VrCullViz.h"
 #include "ParticleObject.h"
@@ -147,6 +148,10 @@ static double gVrMenuDecreaseRepeatAt;
 static double gVrMenuIncreaseHoldStart;
 static double gVrMenuDecreaseHoldStart;
 static bool gVrSettingsLoaded;
+// Body IK persistence cannot depend on the process working directory:
+// LoadVrSettings() may be queried before android.cpp chdir()s into gamedata.
+static bool gBodyIKSettingsLoaded;
+static bool gCutsceneModeSettingsLoaded;
 static bool gViceCityColorEnabled = true;
 // Stable single-frame FXAA. The stronger 3x3 experiment produced no visible
 // headset improvement over this path, so do not expose duplicate choices.
@@ -234,6 +239,11 @@ static int gFoliageSoftness;
 // modes let the headset render it in stereo instead, so the scene has
 // depth and the player can look around inside the shot.
 static int gCutsceneMode;
+// Full-body IK is opt-in. Default preserves the shipped floating-hand experience.
+static int gBodyIKEnabled;
+// Vehicle IK is independent: OFF keeps floating vehicle hands; ON preserves
+// the native seated body and solves only its arms to the vehicle hand poses.
+static int gVehicleBodyIKEnabled;
 // Which camera this cutscene is being watched from: 0 is the director's
 // own, 1 and up are the staged actors in the order the scene put them
 // there. Picking the right one automatically never worked -- what the
@@ -243,6 +253,13 @@ static int gCutsceneCamera;
 static char gCutsceneCameraScene[32];
 static bool gCutsceneCycleDown;
 static bool gCutsceneStoreDown;
+static bool gCutsceneAnchorCalibrationChordDown;
+static bool gCutsceneAnchorSaveDown;
+static bool gCutsceneAnchorCancelDown;
+static bool gCutsceneAnchorConsumeUntilRelease;
+static double gCutsceneAnchorLastAdjustMs;
+static char gCutsceneAnchorNotice[64];
+static double gCutsceneAnchorNoticeUntilMs;
 #if defined(MIAMIVR_DEV_TOOLS) && MIAMIVR_DEV_TOOLS
 static bool gQuestQuickTestStart;
 #endif
@@ -699,6 +716,7 @@ enum eVrVehicleMenuItem {
 	// selector belongs to the kind it names; nothing else is drawn.
 	VR_VEHICLE_KIND = 0,
 	VR_VEHICLE_DRIVING_TYPE,
+	VR_VEHICLE_SITTING_BODY_IK,
 	VR_VEHICLE_THIRD_PERSON,
 	VR_VEHICLE_FORWARD_FIRE,
 	VR_VEHICLE_DEFAULT_SEAT_HEIGHT,
@@ -729,6 +747,7 @@ enum eVrLocomotionMenuItem {
 	VR_LOCOMOTION_SNAP_ANGLE,
 	VR_LOCOMOTION_HEAD_BOBBING,
 	VR_LOCOMOTION_CUTSCENES,
+	VR_LOCOMOTION_BODY_IK,
 	VR_LOCOMOTION_REFRESH_RATE,
 	VR_LOCOMOTION_RECENTER,
 	VR_LOCOMOTION_BACK,
@@ -874,6 +893,249 @@ namespace androidgame {
 static void SaveVrInteger(const char *key, int value);
 static void SaveWristPanels(void);
 
+static bool
+GetBodyIKSettingsPath(char *out, size_t outSize)
+{
+	if(out == nil || outSize == 0)
+		return false;
+
+	const char *root = platform::gameDataRoot();
+	if(root == nil || root[0] == '\0')
+		return false;
+
+	const int written =
+		snprintf(out, outSize, "%s/vr_body_ik.cfg", root);
+	return written > 0 && (size_t)written < outSize;
+}
+
+static bool
+GetCutsceneModeSettingsPath(char *out, size_t outSize)
+{
+	if(out == nil || outSize == 0)
+		return false;
+
+	const char *root = platform::gameDataRoot();
+	if(root == nil || root[0] == '\0')
+		return false;
+
+	const int written =
+		snprintf(out, outSize, "%s/vr_cutscene_mode.cfg", root);
+	return written > 0 && (size_t)written < outSize;
+}
+
+// Read the legacy INI through an absolute path once, when migrating an
+// existing preference to the Android-native persistent setting file.
+static int
+ReadLegacyCutsceneMode(int fallback)
+{
+	char iniPath[512];
+	const char *root = platform::gameDataRoot();
+	if(root == nil || root[0] == '\0')
+		return clamp(fallback, 0, 1);
+
+	const int written =
+		snprintf(iniPath, sizeof(iniPath), "%s/vr_settings.ini", root);
+	if(written <= 0 || (size_t)written >= sizeof(iniPath))
+		return clamp(fallback, 0, 1);
+
+	return clamp((int)(int32)GetPrivateProfileIntA("VR", "CutsceneMode",
+		fallback, iniPath), 0, 1);
+}
+
+static bool
+WritePersistentCutsceneModeSettings(const char *path, int mode)
+{
+	FILE *f = fopen(path, "wb");
+	if(f == nil){
+		__android_log_print(ANDROID_LOG_ERROR, "MiamiVR",
+			"[CutsceneModeSettings] cannot write %s", path);
+		return false;
+	}
+
+	const bool wrote = fprintf(f, "CutsceneMode=%d\n", clamp(mode, 0, 1)) > 0;
+	const bool flushed = fflush(f) == 0;
+	const bool closed = fclose(f) == 0;
+	if(!wrote || !flushed || !closed){
+		__android_log_print(ANDROID_LOG_ERROR, "MiamiVR",
+			"[CutsceneModeSettings] incomplete write to %s", path);
+		return false;
+	}
+	return true;
+}
+
+static void
+LoadPersistentCutsceneModeSettings(void)
+{
+	if(gCutsceneModeSettingsLoaded)
+		return;
+
+	char path[512];
+	if(!GetCutsceneModeSettingsPath(path, sizeof(path)))
+		return; // game-data root may not be ready yet; retry on later access
+
+	FILE *f = fopen(path, "rb");
+	if(f == nil){
+		// First launch with this implementation: preserve any existing
+		// CutsceneMode from vr_settings.ini before creating the native file.
+		const int mode = ReadLegacyCutsceneMode(gCutsceneMode);
+		if(!WritePersistentCutsceneModeSettings(path, mode))
+			return;
+		gCutsceneMode = mode;
+		gCutsceneModeSettingsLoaded = true;
+		__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+			"[CutsceneModeSettings] migrated/created %s CutsceneMode=%d",
+			path, gCutsceneMode);
+		return;
+	}
+
+	int mode = gCutsceneMode;
+	bool modeSeen = false;
+	char line[128];
+	while(fgets(line, sizeof(line), f) != nil){
+		int value = 0;
+		if(sscanf(line, "CutsceneMode=%d", &value) == 1){
+			mode = clamp(value, 0, 1);
+			modeSeen = true;
+		}
+	}
+	fclose(f);
+
+	if(!modeSeen){
+		// Recover a malformed or empty file from the legacy INI if possible.
+		mode = ReadLegacyCutsceneMode(gCutsceneMode);
+		if(!WritePersistentCutsceneModeSettings(path, mode))
+			return;
+	}
+
+	gCutsceneMode = mode;
+	gCutsceneModeSettingsLoaded = true;
+	__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+		"[CutsceneModeSettings] loaded %s CutsceneMode=%d",
+		path, gCutsceneMode);
+}
+
+static void
+SavePersistentCutsceneModeSettings(void)
+{
+	char path[512];
+	if(!GetCutsceneModeSettingsPath(path, sizeof(path))){
+		__android_log_print(ANDROID_LOG_ERROR, "MiamiVR",
+			"[CutsceneModeSettings] save skipped: gameDataRoot unavailable");
+		return;
+	}
+
+	if(!WritePersistentCutsceneModeSettings(path, gCutsceneMode))
+		return;
+
+	gCutsceneModeSettingsLoaded = true;
+	__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+		"[CutsceneModeSettings] saved %s CutsceneMode=%d",
+		path, gCutsceneMode);
+}
+
+static void
+LoadPersistentBodyIKSettings(void)
+{
+	if(gBodyIKSettingsLoaded)
+		return;
+
+	char path[512];
+	if(!GetBodyIKSettingsPath(path, sizeof(path)))
+		return; // storage root not ready; retry later
+
+	FILE *f = fopen(path, "rb");
+	if(f == nil){
+		// First run / no IK settings yet. Create the file immediately so
+		// persistence has one deterministic Android-native location.
+		f = fopen(path, "wb");
+		if(f == nil){
+			__android_log_print(ANDROID_LOG_ERROR, "MiamiVR",
+				"[BodyIKSettings] cannot create %s", path);
+			return;
+		}
+		fprintf(f, "BodyIK=0\nVehicleBodyIK=0\n");
+		fflush(f);
+		fclose(f);
+
+		gBodyIKEnabled = 0;
+		gVehicleBodyIKEnabled = 0;
+		gBodyIKSettingsLoaded = true;
+		__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+			"[BodyIKSettings] created defaults at %s", path);
+		return;
+	}
+
+	int body = 0;
+	int vehicle = 0;
+	bool bodySeen = false;
+	bool vehicleSeen = false;
+	char line[128];
+
+	while(fgets(line, sizeof(line), f) != nil){
+		int value = 0;
+		if(sscanf(line, "BodyIK=%d", &value) == 1){
+			body = value != 0 ? 1 : 0;
+			bodySeen = true;
+		}else if(sscanf(line, "VehicleBodyIK=%d", &value) == 1){
+			vehicle = value != 0 ? 1 : 0;
+			vehicleSeen = true;
+		}
+	}
+	fclose(f);
+
+	if(bodySeen)
+		gBodyIKEnabled = body;
+	if(vehicleSeen)
+		gVehicleBodyIKEnabled = vehicle;
+
+	// A malformed/empty file should not silently become "loaded OFF forever".
+	// Rewrite a canonical file from the values we actually accepted.
+	if(!bodySeen || !vehicleSeen){
+		FILE *rewrite = fopen(path, "wb");
+		if(rewrite != nil){
+			fprintf(rewrite, "BodyIK=%d\nVehicleBodyIK=%d\n",
+				gBodyIKEnabled ? 1 : 0,
+				gVehicleBodyIKEnabled ? 1 : 0);
+			fflush(rewrite);
+			fclose(rewrite);
+		}
+	}
+
+	gBodyIKSettingsLoaded = true;
+	__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+		"[BodyIKSettings] loaded %s BodyIK=%d VehicleBodyIK=%d",
+		path, gBodyIKEnabled, gVehicleBodyIKEnabled);
+}
+
+static void
+SavePersistentBodyIKSettings(void)
+{
+	char path[512];
+	if(!GetBodyIKSettingsPath(path, sizeof(path))){
+		__android_log_print(ANDROID_LOG_ERROR, "MiamiVR",
+			"[BodyIKSettings] save skipped: gameDataRoot unavailable");
+		return;
+	}
+
+	FILE *f = fopen(path, "wb");
+	if(f == nil){
+		__android_log_print(ANDROID_LOG_ERROR, "MiamiVR",
+			"[BodyIKSettings] cannot write %s", path);
+		return;
+	}
+
+	fprintf(f, "BodyIK=%d\nVehicleBodyIK=%d\n",
+		gBodyIKEnabled ? 1 : 0,
+		gVehicleBodyIKEnabled ? 1 : 0);
+	fflush(f);
+	fclose(f);
+
+	gBodyIKSettingsLoaded = true;
+	__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+		"[BodyIKSettings] saved %s BodyIK=%d VehicleBodyIK=%d",
+		path, gBodyIKEnabled, gVehicleBodyIKEnabled);
+}
+
 // Marks a vehicle context as carrying its own values rather than the on-foot
 // ones. Kept out of the placement keys so an older settings file still reads
 // back as plain inheritance.
@@ -962,8 +1224,12 @@ LoadVehicleDeformationSettings(void)
 static void
 LoadVrSettings(void)
 {
-	if(gVrSettingsLoaded)
+	if(gVrSettingsLoaded){
+		// Unlike the legacy INI read, this absolute-path read remains retryable
+		// if the game-data root was not ready during the first settings query.
+		LoadPersistentCutsceneModeSettings();
 		return;
+	}
 	gViceCityColorEnabled =
 		GetPrivateProfileIntA("VR", "ViceCityColor", 1,
 			".\\vr_settings.ini") != 0;
@@ -1016,6 +1282,10 @@ LoadVrSettings(void)
 		"FoliageSoftness", 0, ".\\vr_settings.ini"), 0, 3);
 	gCutsceneMode = clamp((int)(int32)GetPrivateProfileIntA("VR",
 		"CutsceneMode", 0, ".\\vr_settings.ini"), 0, 1);
+	// These Android-specific settings live in gameDataRoot-backed files,
+	// rather than relying on a possibly relative process working directory.
+	LoadPersistentCutsceneModeSettings();
+	LoadPersistentBodyIKSettings();
 	// Remembered across launches so a build handed over for testing can
 	// come up already showing it. Off for everyone else.
 	QuestProfilerSetEnabled(GetPrivateProfileIntA("VR", "ShowProfiler",
@@ -2190,6 +2460,9 @@ VrDebugUpdate(const PadInput &in)
 	// the persisted headset values authoritative after that later load too.
 	ApplyTrafficSettings();
 	const double now = MonotonicMilliseconds();
+	if(gCutsceneAnchorConsumeUntilRelease && !in.a && !in.b &&
+	   !in.leftStickClick && !in.rightStickClick)
+		gCutsceneAnchorConsumeUntilRelease = false;
 	if(gVrWelcomePending && DidPlayerTakeWelcomeStep(in)){
 		gVrWelcomePending = false;
 		gVrMenuVisible = true;
@@ -2281,16 +2554,12 @@ VrDebugUpdate(const PadInput &in)
 	}
 	gVrCheatShortcutDown = cheatShortcut;
 
-	// A stereo cutscene owns the stick clicks while it runs: R3 steps to
-	// the next camera, L3 keeps the one on screen for this scene. The
-	// scene name is the key, so the choice comes back the next time the
-	// same cutscene plays.
+	// During stereo cutscenes, R3 cycles camera source and L3 remembers it
+	// per scene. L3+R3 instead toggles model-specific anchor calibration, so
+	// there is no diagnostic INI switch or desktop file-editing step.
 	const bool cutsceneCameras = !gVrMenuVisible && gCutsceneMode != 0 &&
 		(CCutsceneMgr::IsRunning() || TheCamera.m_WideScreenOn);
 	if(cutsceneCameras){
-		// A scripted sequence has no name of its own, so every one of
-		// them shares a key. They are rare and they are all the same
-		// kind of shot.
 		const char *scene = CCutsceneMgr::IsRunning() ?
 			CCutsceneMgr::GetCutsceneName() : "scripted";
 		if(scene != nil &&
@@ -2301,22 +2570,94 @@ VrDebugUpdate(const PadInput &in)
 			gCutsceneCameraScene[sizeof(gCutsceneCameraScene)-1] = '\0';
 			LoadCutsceneCameraForScene(gCutsceneCameraScene);
 		}
-		const bool cycle = in.rightStickClick && !in.leftStickClick;
-		const bool store = in.leftStickClick && !in.rightStickClick;
-		if(cycle && !gCutsceneCycleDown){
-			// One past the last actor wraps back to the director.
-			const int cameras = androidgame::VrCutsceneCameraCount();
-			gCutsceneCamera = cameras > 0 ?
-				(gCutsceneCamera+1)%cameras : 0;
+		const bool calibrationChord = in.leftStickClick && in.rightStickClick;
+		if(calibrationChord && !gCutsceneAnchorCalibrationChordDown){
+			if(androidgame::VrCutsceneCameraAnchorCalibrationActive()){
+				androidgame::VrCancelCutsceneCameraAnchorCalibration();
+				gCutsceneAnchorConsumeUntilRelease = true;
+				gCutsceneAnchorLastAdjustMs = 0.0;
+				snprintf(gCutsceneAnchorNotice, sizeof(gCutsceneAnchorNotice),
+					"CHANGES DISCARDED");
+				gCutsceneAnchorNoticeUntilMs = now+1800.0;
+			}else if(androidgame::VrStartCutsceneCameraAnchorCalibration()){
+				gCutsceneAnchorLastAdjustMs = now;
+				gCutsceneAnchorNotice[0] = '\0';
+			}else{
+				snprintf(gCutsceneAnchorNotice, sizeof(gCutsceneAnchorNotice),
+					"SELECT ACTOR CAMERA WITH R3 FIRST");
+				gCutsceneAnchorNoticeUntilMs = now+2600.0;
+			}
 		}
-		if(store && !gCutsceneStoreDown &&
-		   gCutsceneCameraScene[0] != '\0')
-			SaveCutsceneCameraForScene(gCutsceneCameraScene);
-		gCutsceneCycleDown = cycle;
-		gCutsceneStoreDown = store;
+		gCutsceneAnchorCalibrationChordDown = calibrationChord;
+
+		if(androidgame::VrCutsceneCameraAnchorCalibrationActive()){
+			// Controller axes move the anchor in the actor-local frame. Keep a
+			// small deadzone and rate-limit the motion so calibration is precise.
+			const double elapsed = gCutsceneAnchorLastAdjustMs > 0.0 ?
+				Min(Max((now-gCutsceneAnchorLastAdjustMs)/1000.0, 0.0), 0.05) :
+				0.0;
+			gCutsceneAnchorLastAdjustMs = now;
+			auto calibrationAxis = [](float value) -> float {
+				return Abs(value) < 0.18f ? 0.0f : value;
+			};
+			const float speedCmPerSecond = 12.0f;
+			androidgame::VrAdjustCutsceneCameraAnchor(
+				calibrationAxis(in.leftStickX)*speedCmPerSecond*(float)elapsed,
+				calibrationAxis(in.rightStickY)*speedCmPerSecond*(float)elapsed,
+				calibrationAxis(in.leftStickY)*speedCmPerSecond*(float)elapsed);
+			const bool save = in.a && !gCutsceneAnchorSaveDown;
+			const bool cancel = in.b && !gCutsceneAnchorCancelDown;
+			if(save){
+				gCutsceneAnchorConsumeUntilRelease = true;
+				if(androidgame::VrSaveCutsceneCameraAnchorCalibration()){
+					__android_log_print(ANDROID_LOG_INFO, "MiamiVR",
+						"cutscene anchor saved from in-headset calibration");
+					snprintf(gCutsceneAnchorNotice, sizeof(gCutsceneAnchorNotice),
+						"ANCHOR SAVED");
+					gCutsceneAnchorNoticeUntilMs = now+1800.0;
+				}else{
+					snprintf(gCutsceneAnchorNotice, sizeof(gCutsceneAnchorNotice),
+						"SAVE FAILED - PRESS A TO RETRY");
+					gCutsceneAnchorNoticeUntilMs = now+1800.0;
+				}
+			}
+			if(cancel){
+				gCutsceneAnchorConsumeUntilRelease = true;
+				androidgame::VrCancelCutsceneCameraAnchorCalibration();
+				snprintf(gCutsceneAnchorNotice, sizeof(gCutsceneAnchorNotice),
+					"CHANGES DISCARDED");
+				gCutsceneAnchorNoticeUntilMs = now+1800.0;
+			}
+			gCutsceneAnchorSaveDown = in.a;
+			gCutsceneAnchorCancelDown = in.b;
+			gCutsceneCycleDown = false;
+			gCutsceneStoreDown = false;
+		}else{
+			const bool cycle = in.rightStickClick && !in.leftStickClick;
+			const bool store = in.leftStickClick && !in.rightStickClick;
+			if(cycle && !gCutsceneCycleDown){
+				// One past the last actor wraps back to the director.
+				const int cameras = androidgame::VrCutsceneCameraCount();
+				gCutsceneCamera = cameras > 0 ?
+					(gCutsceneCamera+1)%cameras : 0;
+			}
+			if(store && !gCutsceneStoreDown &&
+			   gCutsceneCameraScene[0] != '\0')
+				SaveCutsceneCameraForScene(gCutsceneCameraScene);
+			gCutsceneCycleDown = cycle;
+			gCutsceneStoreDown = store;
+			gCutsceneAnchorSaveDown = false;
+			gCutsceneAnchorCancelDown = false;
+		}
 	}else{
+		if(androidgame::VrCutsceneCameraAnchorCalibrationActive())
+			androidgame::VrCancelCutsceneCameraAnchorCalibration();
 		gCutsceneCycleDown = false;
 		gCutsceneStoreDown = false;
+		gCutsceneAnchorCalibrationChordDown = false;
+		gCutsceneAnchorSaveDown = false;
+		gCutsceneAnchorCancelDown = false;
+		gCutsceneAnchorLastAdjustMs = 0.0;
 		gCutsceneCameraScene[0] = '\0';
 	}
 
@@ -2968,6 +3309,7 @@ VrDebugUpdate(const PadInput &in)
 			const bool cockpitLocked =
 				OculusVR::IsQuestVehicleThirdPerson() &&
 				gVrVehicleSelection != VR_VEHICLE_THIRD_PERSON &&
+				gVrVehicleSelection != VR_VEHICLE_SITTING_BODY_IK &&
 				gVrVehicleSelection != VR_VEHICLE_FORWARD_FIRE &&
 				gVrVehicleSelection != VR_VEHICLE_BACK;
 			if(!cockpitLocked)
@@ -2980,6 +3322,12 @@ VrDebugUpdate(const PadInput &in)
 				break;
 			case VR_VEHICLE_DRIVING_TYPE:
 				OculusVR::CycleQuestVehicleKindDrivingType(direction);
+				break;
+			case VR_VEHICLE_SITTING_BODY_IK:
+				LoadPersistentBodyIKSettings();
+				gVehicleBodyIKEnabled = !gVehicleBodyIKEnabled;
+				SavePersistentBodyIKSettings();
+				VrBodyIK::Reset();
 				break;
 			case VR_VEHICLE_FORWARD_FIRE:
 				OculusVR::SetQuestVehicleForwardFireEnabled(
@@ -3126,13 +3474,24 @@ VrDebugUpdate(const PadInput &in)
 				}
 				break;
 			case VR_LOCOMOTION_CUTSCENES:
+				// Load first in case game-data storage became ready after startup.
+				LoadPersistentCutsceneModeSettings();
 				gCutsceneMode = (gCutsceneMode+2+
 					(decreasePulse ? -1 : 1))%2;
+				SavePersistentCutsceneModeSettings();
+				// Keep the legacy INI value updated for older builds too.
 				SaveVrInteger("CutsceneMode", gCutsceneMode);
 				break;
 			case VR_LOCOMOTION_HEAD_BOBBING:
 				gQuestHeadBobbing = !gQuestHeadBobbing;
 				SaveVrInteger("HeadBobbing", gQuestHeadBobbing);
+				break;
+			case VR_LOCOMOTION_BODY_IK:
+				LoadPersistentBodyIKSettings();
+				gBodyIKEnabled = !gBodyIKEnabled;
+				SavePersistentBodyIKSettings();
+				// Never reuse body/arm caches across an ownership switch.
+				VrBodyIK::Reset();
 				break;
 			case VR_LOCOMOTION_REFRESH_RATE: {
 				static const int rates[] = { 72, 80, 90, 120 };
@@ -4053,6 +4412,7 @@ DrawQuestWristRadarPage(void)
 static void
 DrawQuestVehiclePage(void)
 {
+	LoadPersistentBodyIKSettings();
 	BeginFullVrMenuPage("VEHICLE SETTINGS",
 		"DRIVING CONTROLS AND PER-VEHICLE CALIBRATION");
 	char rows[VR_VEHICLE_ITEM_COUNT][112];
@@ -4065,6 +4425,9 @@ DrawQuestVehiclePage(void)
 		"DRIVING TYPE  < %s >", thirdPersonView ?
 			"DEFAULT (THIRD PERSON)" :
 			OculusVR::GetQuestVehicleKindDrivingTypeName());
+	snprintf(rows[VR_VEHICLE_SITTING_BODY_IK], sizeof(rows[0]),
+		"SITTING BODY IK  < %s >",
+		gVehicleBodyIKEnabled ? "ON" : "OFF");
 	snprintf(rows[VR_VEHICLE_THIRD_PERSON], sizeof(rows[0]),
 		"VIEW  < %s >",
 		thirdPersonView ? "THIRD PERSON" : "FIRST PERSON");
@@ -4218,6 +4581,7 @@ DrawQuestVehicleCalibrationPage(void)
 static void
 DrawQuestLocomotionPage(void)
 {
+	LoadPersistentBodyIKSettings();
 	BeginFullVrMenuPage("LOCOMOTION",
 		"MOVEMENT AND COMFORT TURNING");
 	char rows[VR_LOCOMOTION_ITEM_COUNT][112];
@@ -4247,12 +4611,14 @@ DrawQuestLocomotionPage(void)
 	snprintf(rows[VR_LOCOMOTION_CUTSCENES], sizeof(rows[0]),
 		"CUTSCENES  < %s >",
 		gCutsceneMode ? "STEREO  R3 CAMERA  L3 KEEP" : "CINEMA SCREEN");
+	snprintf(rows[VR_LOCOMOTION_BODY_IK], sizeof(rows[0]),
+		"BODY IK  < %s >", gBodyIKEnabled ? "ON" : "OFF");
 	snprintf(rows[VR_LOCOMOTION_REFRESH_RATE], sizeof(rows[0]),
 		"REFRESH RATE  < %d HZ >", gQuestRefreshRateHz);
 	strcpy(rows[VR_LOCOMOTION_RECENTER], "RECENTER VIEW");
 	strcpy(rows[VR_LOCOMOTION_BACK], "BACK TO SETTINGS");
 	for(int item = 0; item < VR_LOCOMOTION_ITEM_COUNT; item++)
-		DrawFullVrMenuRow(rows[item], 190+item*68, 3,
+		DrawFullVrMenuRow(rows[item], 160+item*54, 3,
 			item == gVrLocomotionSelection);
 	// The one setting a standing player can be hurt by without knowing why.
 	if(gVrLocomotionSelection == VR_LOCOMOTION_MOVEMENT_ORIENTATION)
@@ -4542,12 +4908,68 @@ SpawnDenyReasonName(int reason)
 	return reason >= 0 && reason < 16 ? names[reason] : "NONE";
 }
 
+static void
+DrawCutsceneCameraAnchorCalibrationPage(void)
+{
+	// This is a head-locked translucent status card, not a full-screen menu:
+	// keep the cutscene visible so the player can judge the anchor live.
+	FillVrMenuRect(0, 0, VR_MENU_WIDTH, VR_MENU_HEIGHT, 0, 0, 0, 0);
+	FillVrMenuRect(120, 28, VR_MENU_WIDTH-120, 258,
+		5, 10, 20, 220);
+	FillVrMenuRect(120, 28, VR_MENU_WIDTH-120, 34,
+		95, 32, 78, 235);
+	DrawVrMenuText("CUTSCENE CAMERA ANCHOR", VR_MENU_WIDTH/2, 48, 3,
+		255, 120, 205);
+	char modelName[48];
+	float sideCm = 0.0f, forwardCm = 0.0f, heightCm = 0.0f;
+	int modelIndex = -1;
+	androidgame::VrGetCutsceneCameraAnchorCalibrationStatus(modelName,
+		sizeof(modelName), &sideCm, &forwardCm, &heightCm, &modelIndex);
+	char line[160];
+	snprintf(line, sizeof(line), "MODEL %s  INDEX %d", modelName,
+		modelIndex);
+	DrawVrMenuText(line, VR_MENU_WIDTH/2, 88, 2, 240, 240, 240);
+	snprintf(line, sizeof(line), "SIDE %+05.1f CM  FORWARD %+05.1f CM  HEIGHT %+05.1f CM",
+		sideCm, forwardCm, heightCm);
+	DrawVrMenuText(line, VR_MENU_WIDTH/2, 120, 2, 120, 220, 255);
+	DrawVrMenuText("LEFT STICK X SIDE  LEFT STICK Y HEIGHT",
+		VR_MENU_WIDTH/2, 158, 2, 235, 220, 170);
+	DrawVrMenuText("RIGHT STICK Y FORWARD BACK",
+		VR_MENU_WIDTH/2, 186, 2, 235, 220, 170);
+	DrawVrMenuText("A SAVE AND EXIT   B OR L3+R3 CANCEL",
+		VR_MENU_WIDTH/2, 216, 2, 255, 180, 225);
+}
+
+static void
+DrawCutsceneCameraAnchorNotice(void)
+{
+	FillVrMenuRect(0, 0, VR_MENU_WIDTH, VR_MENU_HEIGHT, 0, 0, 0, 0);
+	FillVrMenuRect(180, 48, VR_MENU_WIDTH-180, 136,
+		5, 10, 20, 220);
+	DrawVrMenuText(gCutsceneAnchorNotice, VR_MENU_WIDTH/2, 82, 3,
+		255, 180, 225);
+}
+
 // Fills the same 1024x768 menu surface as desktop. Compact diagnostics use
 // 512x128 for the FPS line and 512x437 for the full profiler.
 const unsigned char *
 VrDebugPixels(int *width, int *height)
 {
 	const bool profilerVisible = QuestProfilerIsEnabled();
+	const bool anchorCalibration =
+		androidgame::VrCutsceneCameraAnchorCalibrationActive();
+	const bool anchorNotice = !gVrMenuVisible && !anchorCalibration &&
+		gCutsceneAnchorNotice[0] != '\0' &&
+		MonotonicMilliseconds() < gCutsceneAnchorNoticeUntilMs;
+	if(anchorCalibration || anchorNotice){
+		*width = VR_MENU_WIDTH;
+		*height = VR_MENU_HEIGHT;
+		if(anchorCalibration)
+			DrawCutsceneCameraAnchorCalibrationPage();
+		else
+			DrawCutsceneCameraAnchorNotice();
+		return gVrMenuPixels;
+	}
 	*width = gVrMenuVisible ? VR_MENU_WIDTH : VR_DEBUG_WIDTH;
 	*height = gVrMenuVisible ? VR_MENU_HEIGHT :
 		(profilerVisible ? VR_DEBUG_HEIGHT : VR_FPS_HEIGHT);
@@ -4893,7 +5315,9 @@ VrMenuConsumesInput(void)
 {
 	// Keep the service chord from leaking through as Pause when the menu is
 	// opened or closed. Gameplay resumes only after Menu has been released.
-	return gVrMenuVisible || gVrMenuShortcutDown;
+	return gVrMenuVisible || gVrMenuShortcutDown ||
+		gCutsceneAnchorConsumeUntilRelease ||
+		androidgame::VrCutsceneCameraAnchorCalibrationActive();
 }
 
 bool
@@ -4901,6 +5325,22 @@ VrViceCityColorEnabled(void)
 {
 	LoadVrSettings();
 	return gViceCityColorEnabled;
+}
+
+bool
+VrBodyIKEnabled(void)
+{
+	LoadVrSettings();
+	LoadPersistentBodyIKSettings();
+	return gBodyIKEnabled != 0;
+}
+
+bool
+VrVehicleBodyIKEnabled(void)
+{
+	LoadVrSettings();
+	LoadPersistentBodyIKSettings();
+	return gVehicleBodyIKEnabled != 0;
 }
 
 int

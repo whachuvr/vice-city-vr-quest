@@ -115,6 +115,11 @@ git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v18.patch" || {
     echo "The runtime v18 patch did not apply after the runtime v17 patch."
     exit 1
 }
+
+git apply --whitespace=nowarn "$REPO/patches/revc-quest-runtime-v19.patch" || {
+    echo "The runtime v19 patch did not apply after the runtime v18 patch."
+    exit 1
+}
 rm -rf "$OUT/.git"
 
 echo "[3/4] Copying the port sources..."

@@ -14,6 +14,7 @@
 #include "skeleton.h"
 #include "android.h"
 #include "VrVehicleSeatRecenter.h"
+#include "VrBodyIK.h"
 #include "xr_vulkan_session.h"
 
 #include "main.h"
@@ -35,7 +36,9 @@
 #include "RpAnimBlend.h"
 #include "AnimBlendClumpData.h"
 #include "Bones.h"
+#include "AnimBlendAssociation.h"
 #include "ModelIndices.h"
+#include "ModelInfo.h"
 #include "Vehicle.h"
 #include "World.h"
 #include "Draw.h"
@@ -352,6 +355,8 @@ _psGetUserFilesFolder(void)
 }
 
 static androidgame::PadInput gPadInput;
+static bool gVrRawCrouchJustDown;
+static bool gVrRawCrouchConsumed;
 
 // Read by psTimer; written once per frame from the XR layer.
 long long gVrFrameTimeNs;
@@ -360,7 +365,29 @@ namespace androidgame {
 void
 SetPadInput(const PadInput &input)
 {
+	const bool oldL3 = gPadInput.leftStickClick;
+	gVrRawCrouchJustDown =
+		input.leftStickClick && !oldL3;
+
+	// A physical L3 rising edge can be queried by several game systems during
+	// the same frame. Reset the consume latch only for a NEW physical press.
+	if(gVrRawCrouchJustDown)
+		gVrRawCrouchConsumed = false;
+
 	gPadInput = input;
+}
+
+bool
+VrCrouchJustDown(void)
+{
+	// Consume exactly once per physical L3 press. This is the behavior that
+	// stopped same-frame duplicate DuckJustDown() callers from instantly
+	// toggling native crouch back off.
+	if(!gVrRawCrouchJustDown || gVrRawCrouchConsumed)
+		return false;
+
+	gVrRawCrouchConsumed = true;
+	return true;
 }
 
 const PadInput &
@@ -526,6 +553,9 @@ CEntity *gVrPlayerEntity;
 bool gVrInVehicle;
 bool gVrHidePlayerBody = true;
 
+static CVector gVrOnFootBodyAnchor;
+static bool gVrOnFootBodyAnchorValid;
+
 // The shape of the cinema screen theater mode draws on. The game lays its
 // interface out for this ratio while theater mode is up, so the plane in
 // android_main and CDraw both take it from here.
@@ -552,6 +582,17 @@ androidgame::VrGetViewBasis(float position[3], float right[3], float up[3],
 		if(forward != nil) forward[i] = va[i];
 		if(position != nil) position[i] = vp[i];
 	}
+	return true;
+}
+
+bool
+androidgame::VrGetOnFootBodyAnchor(float position[3])
+{
+	if(!gVrOnFootBodyAnchorValid || position == nil)
+		return false;
+	position[0] = gVrOnFootBodyAnchor.x;
+	position[1] = gVrOnFootBodyAnchor.y;
+	position[2] = gVrOnFootBodyAnchor.z;
 	return true;
 }
 
@@ -677,31 +718,22 @@ androidgame::VrCutsceneCameraCount(void)
 }
 
 static bool
-GetCutsceneActorHead(int camera, CVector *head, CVector *forward)
+GetAnimatedPedHeadPose(CEntity *actor, CVector *head, CVector *forward)
 {
-	gCutsceneCameraActor = nil;
-	if(camera <= 0)
+	if(actor == nil || head == nil || forward == nil)
 		return false;
-	CEntity *actors[NUMCUTSCENEOBJECTS];
-	const int staged = StageCutsceneCameras(actors, ARRAY_SIZE(actors));
-	if(camera > staged)
-		return false;
-	CEntity *actor = actors[camera-1];
 	RpHAnimHierarchy *hierarchy = GetPosedHeadHierarchy(actor);
 	if(hierarchy == nil)
 		return false;
-	RwMatrix *bonePose = &RpHAnimHierarchyGetMatrixArray(hierarchy)[
-		RpHAnimIDGetIndex(hierarchy, BONE_head)];
+	const int headIndex = RpHAnimIDGetIndex(hierarchy, BONE_head);
+	if(headIndex < 0)
+		return false;
+	RwMatrix *bonePose =
+		&RpHAnimHierarchyGetMatrixArray(hierarchy)[headIndex];
+
 	*head = CVector(RwMatrixGetPos(bonePose)->x,
 		RwMatrixGetPos(bonePose)->y,
 		RwMatrixGetPos(bonePose)->z);
-	// Where the actor is actually looking, taken off the bone. The root is
-	// no use: an actor is staged once and only its skeleton is animated
-	// after that, so the root still faces wherever the scene dropped it --
-	// which is how the view kept ending up behind the character's head.
-	// CPedIK yaws a head bone about its local X and pitches it about local
-	// Z, so the look axis is the remaining one, local Y: the up column of
-	// the posed matrix.
 	*forward = CVector(RwMatrixGetUp(bonePose)->x,
 		RwMatrixGetUp(bonePose)->y,
 		RwMatrixGetUp(bonePose)->z);
@@ -713,10 +745,504 @@ GetCutsceneActorHead(int camera, CVector *head, CVector *forward)
 	if(forward->MagnitudeSqr() < 0.0001f)
 		*forward = CVector(0.0f, 1.0f, 0.0f);
 	forward->Normalise();
+	return true;
+}
+
+static bool
+GetAnimatedActorHead(CEntity *actor, CVector *head, CVector *forward)
+{
+	// Cutscene cameras and gameplay vehicle transitions share the same animated
+	// head-pose source. Only actual cutscene selection owns/hides that actor.
+	if(!GetAnimatedPedHeadPose(actor, head, forward))
+		return false;
 	gCutsceneCameraActor = actor;
 	return true;
 }
 
+static bool
+ContainsNoCase(const char *text, const char *needle)
+{
+	if(text == nil || needle == nil || needle[0] == '\0')
+		return false;
+
+	const size_t needleLen = strlen(needle);
+	for(const char *p = text; *p; p++){
+		size_t i = 0;
+		for(; i < needleLen; i++){
+			if(p[i] == '\0')
+				break;
+			const char ca = p[i] >= 'A' && p[i] <= 'Z' ?
+				(char)(p[i]-'A'+'a') : p[i];
+			const char cb = needle[i] >= 'A' && needle[i] <= 'Z' ?
+				(char)(needle[i]-'A'+'a') : needle[i];
+			if(ca != cb)
+				break;
+		}
+		if(i == needleLen)
+			return true;
+	}
+	return false;
+}
+
+static bool
+IsTommyCutsceneActor(CEntity *actor)
+{
+	if(actor == nil || GetPosedHeadHierarchy(actor) == nil)
+		return false;
+
+	// Formal cutscenes frequently use a dedicated cutscene-player model rather
+	// than Tommy's live-world model index. Match the model's actual name.
+	CBaseModelInfo *model =
+		CModelInfo::GetModelInfo(actor->GetModelIndex());
+	const char *modelName =
+		model != nil ? model->GetModelName() : nil;
+
+	if(ContainsNoCase(modelName, "csplay") ||
+	   ContainsNoCase(modelName, "player") ||
+	   ContainsNoCase(modelName, "tommy"))
+		return true;
+
+	// Some special cutscene entries have generic model names, but their active
+	// animation hierarchy still identifies the player role.
+	if(actor->m_rwObject != nil &&
+	   RwObjectGetType(actor->m_rwObject) == rpCLUMP){
+		CAnimBlendAssociation *assoc =
+			RpAnimBlendClumpGetFirstAssociation(
+				(RpClump*)actor->m_rwObject);
+		if(assoc != nil && assoc->hierarchy != nil){
+			const char *animName = assoc->hierarchy->name;
+			if(ContainsNoCase(animName, "tommy") ||
+			   ContainsNoCase(animName, "player") ||
+			   ContainsNoCase(animName, "csplay"))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool
+GetTommyCutsceneHead(CVector *head, CVector *forward)
+{
+	CPlayerPed *player = FindPlayerPed();
+	if(player == nil)
+		return false;
+
+	if(CCutsceneMgr::IsRunning() ||
+	   CCutsceneMgr::IsCutsceneProcessing()){
+		const int count =
+			Min(CCutsceneMgr::GetNumCutsceneObjects(),
+			    (int)NUMCUTSCENEOBJECTS);
+
+		for(int i = 0; i < count; i++){
+			CEntity *actor =
+				CCutsceneMgr::GetCutsceneObject(i);
+			if(IsTommyCutsceneActor(actor) &&
+			   GetAnimatedActorHead(actor, head, forward))
+				return true;
+		}
+		return false;
+	}
+
+	// Scripted widescreen scenes use the real player rather than staged
+	// CCutsceneObjects.
+	if(TheCamera.m_WideScreenOn)
+		return GetAnimatedActorHead(player, head, forward);
+
+	return false;
+}
+
+static bool
+GetCutsceneActorHead(int camera, CVector *head, CVector *forward)
+{
+	gCutsceneCameraActor = nil;
+	if(camera <= 0)
+		return false;
+	CEntity *actors[NUMCUTSCENEOBJECTS];
+	const int staged = StageCutsceneCameras(actors, ARRAY_SIZE(actors));
+	if(camera > staged)
+		return false;
+	CEntity *actor = actors[camera-1];
+	return GetAnimatedActorHead(actor, head, forward);
+}
+
+// A small per-model calibration table. Offsets are stored in centimetres in
+// the actor's local horizontal frame; height is relative to the existing 4 cm
+// lift above the authored head bone. The app-specific game-data directory
+// keeps the values on the Quest without requiring vr_settings.ini edits.
+struct CutsceneCameraAnchorProfile {
+	bool used;
+	int modelIndex;
+	char modelName[48];
+	float sideCm;
+	float forwardCm;
+	float heightCm;
+};
+
+static const int CUTSCENE_CAMERA_ANCHOR_PROFILE_LIMIT = 128;
+static CutsceneCameraAnchorProfile gCutsceneCameraAnchorProfiles[
+	CUTSCENE_CAMERA_ANCHOR_PROFILE_LIMIT];
+static int gCutsceneCameraAnchorProfileCount;
+static bool gCutsceneCameraAnchorProfilesLoaded;
+static bool gCutsceneCameraAnchorDefaultsSeeded;
+static bool gCutsceneCameraAnchorCalibrationActive;
+static int gCutsceneCameraAnchorCalibrationProfile = -1;
+static int gCutsceneCameraAnchorCalibrationModel = -1;
+static char gCutsceneCameraAnchorCalibrationName[48];
+static float gCutsceneCameraAnchorOriginalSideCm;
+static float gCutsceneCameraAnchorOriginalForwardCm;
+static float gCutsceneCameraAnchorOriginalHeightCm;
+
+static bool
+GetCutsceneCameraAnchorPath(char *out, size_t outSize)
+{
+	if(out == nil || outSize == 0)
+		return false;
+	const char *root = platform::gameDataRoot();
+	if(root == nil || root[0] == '\0')
+		return false;
+	const int written = snprintf(out, outSize,
+		"%s/vr_cutscene_camera_anchors.cfg", root);
+	return written > 0 && (size_t)written < outSize;
+}
+
+static void
+GetCutsceneCameraModelKey(int modelIndex, char *out, size_t outSize)
+{
+	if(out == nil || outSize == 0)
+		return;
+	const char *name = nil;
+	if(modelIndex >= 0){
+		CBaseModelInfo *model = CModelInfo::GetModelInfo(modelIndex);
+		name = model != nil ? model->GetModelName() : nil;
+	}
+	if(name == nil || name[0] == '\0'){
+		snprintf(out, outSize, "MODEL_%d", modelIndex);
+		return;
+	}
+	size_t written = 0;
+	for(; *name != '\0' && written+1 < outSize; name++){
+		char c = *name;
+		if(c >= 'a' && c <= 'z')
+			c = (char)(c-'a'+'A');
+		if(!((c >= 'A' && c <= 'Z') ||
+		     (c >= '0' && c <= '9') || c == '_' || c == '-'))
+			c = '_';
+		out[written++] = c;
+	}
+	out[written] = '\0';
+	if(written == 0)
+		snprintf(out, outSize, "MODEL_%d", modelIndex);
+}
+
+static int
+FindCutsceneCameraAnchorProfile(const char *modelName, int modelIndex,
+	bool create)
+{
+	for(int i = 0; i < gCutsceneCameraAnchorProfileCount; i++){
+		CutsceneCameraAnchorProfile &profile =
+			gCutsceneCameraAnchorProfiles[i];
+		if(profile.used && strcmp(profile.modelName, modelName) == 0){
+			profile.modelIndex = modelIndex;
+			return i;
+		}
+	}
+	if(!create || gCutsceneCameraAnchorProfileCount >=
+	   CUTSCENE_CAMERA_ANCHOR_PROFILE_LIMIT)
+		return -1;
+	const int index = gCutsceneCameraAnchorProfileCount++;
+	CutsceneCameraAnchorProfile &profile =
+		gCutsceneCameraAnchorProfiles[index];
+		memset(&profile, 0, sizeof(profile));
+	profile.used = true;
+	profile.modelIndex = modelIndex;
+	snprintf(profile.modelName, sizeof(profile.modelName), "%s", modelName);
+	return index;
+}
+
+// Quest calibration exported by the user on 2026-10-10. These values are
+// compiled into the game so a fresh install gets the calibrated anchors even
+// when no vr_cutscene_camera_anchors.cfg exists yet. A saved on-device profile
+// is still read afterward and takes precedence, allowing further in-headset
+// adjustments to remain persistent.
+static void
+SeedCutsceneCameraAnchorDefaults(void)
+{
+	if(gCutsceneCameraAnchorDefaultsSeeded)
+		return;
+	gCutsceneCameraAnchorDefaultsSeeded = true;
+	struct BuiltInAnchor {
+		const char *modelName;
+		int modelIndex;
+		float sideCm;
+		float forwardCm;
+		float heightCm;
+	};
+	static const BuiltInAnchor defaults[] = {
+		{ "CSPLAY",  109, -1.278f,  9.788f,  2.942f },
+		{ "PLAYER",    0, -3.232f,  6.593f, 16.020f },
+		{ "PLAYER2",   0, -1.210f, 11.107f, 18.265f },
+		{ "CSPLAY2", 109,  1.684f,  9.417f,  4.843f }
+	};
+	for(size_t i = 0; i < ARRAY_SIZE(defaults); i++){
+		const BuiltInAnchor &value = defaults[i];
+		const int index = FindCutsceneCameraAnchorProfile(
+			value.modelName, value.modelIndex, true);
+		if(index < 0){
+			ALOGE("cutscene camera anchor default table is full for %s",
+				value.modelName);
+			continue;
+		}
+		CutsceneCameraAnchorProfile &profile =
+			gCutsceneCameraAnchorProfiles[index];
+		profile.sideCm = value.sideCm;
+		profile.forwardCm = value.forwardCm;
+		profile.heightCm = value.heightCm;
+		ALOG("cutscene camera built-in anchor: model=%s index=%d side=%.3fcm forward=%.3fcm height=%.3fcm",
+			profile.modelName, profile.modelIndex, profile.sideCm,
+			profile.forwardCm, profile.heightCm);
+	}
+}
+
+static void
+LoadCutsceneCameraAnchorProfiles(void)
+{
+	if(gCutsceneCameraAnchorProfilesLoaded)
+		return;
+	SeedCutsceneCameraAnchorDefaults();
+	char path[512];
+	if(!GetCutsceneCameraAnchorPath(path, sizeof(path)))
+		return; // storage root is not ready yet; retry on the next frame
+	FILE *file = fopen(path, "rb");
+	if(file != nil){
+		char line[192];
+		while(fgets(line, sizeof(line), file) != nil){
+			char modelName[48];
+			int modelIndex = -1;
+			float sideCm = 0.0f, forwardCm = 0.0f, heightCm = 0.0f;
+			if(sscanf(line, "%47s %d %f %f %f", modelName, &modelIndex,
+			   &sideCm, &forwardCm, &heightCm) != 5)
+				continue;
+			const int index = FindCutsceneCameraAnchorProfile(
+				modelName, modelIndex, true);
+			if(index < 0)
+				break;
+			CutsceneCameraAnchorProfile &profile =
+				gCutsceneCameraAnchorProfiles[index];
+			profile.sideCm = clamp(sideCm, -50.0f, 50.0f);
+			profile.forwardCm = clamp(forwardCm, -50.0f, 50.0f);
+			profile.heightCm = clamp(heightCm, -50.0f, 50.0f);
+		}
+		fclose(file);
+	}
+	gCutsceneCameraAnchorProfilesLoaded = true;
+	ALOG("cutscene camera anchors loaded: %d profile(s) from %s",
+		gCutsceneCameraAnchorProfileCount, path);
+}
+
+static bool
+SaveCutsceneCameraAnchorProfiles(void)
+{
+	char path[512];
+	if(!GetCutsceneCameraAnchorPath(path, sizeof(path))){
+		ALOGE("cutscene camera anchor save skipped: game-data path unavailable");
+		return false;
+	}
+	FILE *file = fopen(path, "wb");
+	if(file == nil){
+		ALOGE("cannot write cutscene camera anchor profiles: %s", path);
+		return false;
+	}
+	fprintf(file, "# model modelIndex sideCm forwardCm heightCm\n");
+	for(int i = 0; i < gCutsceneCameraAnchorProfileCount; i++){
+		const CutsceneCameraAnchorProfile &profile =
+			gCutsceneCameraAnchorProfiles[i];
+		if(!profile.used)
+			continue;
+		fprintf(file, "%s %d %.3f %.3f %.3f\n", profile.modelName,
+			profile.modelIndex, profile.sideCm, profile.forwardCm,
+			profile.heightCm);
+	}
+	const bool saved = fflush(file) == 0;
+	const int closeResult = fclose(file);
+	if(!saved || closeResult != 0){
+		ALOGE("failed while writing cutscene camera anchor profiles: %s", path);
+		return false;
+	}
+	ALOG("cutscene camera anchor profiles saved: %d profile(s) to %s",
+		gCutsceneCameraAnchorProfileCount, path);
+	return true;
+}
+
+static void
+GetCutsceneCameraAnchorOffset(CEntity *actor, float *sideCm,
+	float *forwardCm, float *heightCm)
+{
+	if(sideCm != nil) *sideCm = 0.0f;
+	if(forwardCm != nil) *forwardCm = 0.0f;
+	if(heightCm != nil) *heightCm = 0.0f;
+	if(actor == nil)
+		return;
+	const int modelIndex = actor->GetModelIndex();
+	if(modelIndex < 0)
+		return;
+	LoadCutsceneCameraAnchorProfiles();
+	// Built-in profiles remain usable even if Quest app storage is not ready;
+	// LoadCutsceneCameraAnchorProfiles will retry reading the saved file later.
+	char modelName[48];
+	GetCutsceneCameraModelKey(modelIndex, modelName, sizeof(modelName));
+	int index = FindCutsceneCameraAnchorProfile(modelName,
+		modelIndex, false);
+	if(index < 0){
+		// Unknown/replacement model names should inherit the calibration that
+		// already fits their role instead of falling back to only the raw 4 cm
+		// lift. Live-world player scenes use PLAYER; staged cutscene actors use
+		// CSPLAY. Exact per-model profiles above still take priority.
+		const bool isLivePlayer = actor == FindPlayerPed();
+		const char *fallbackName = isLivePlayer ? "PLAYER" : "CSPLAY";
+		// Look up the template without FindCutsceneCameraAnchorProfile(): that
+		// routine updates modelIndex on a name match, which would corrupt the
+		// canonical PLAYER/CSPLAY entry when it is reused by another model.
+		for(int i = 0; i < gCutsceneCameraAnchorProfileCount; i++){
+			const CutsceneCameraAnchorProfile &profile =
+				gCutsceneCameraAnchorProfiles[i];
+			if(profile.used && strcmp(profile.modelName, fallbackName) == 0){
+				index = i;
+				break;
+			}
+		}
+	}
+	if(index < 0)
+		return;
+	const CutsceneCameraAnchorProfile &profile =
+		gCutsceneCameraAnchorProfiles[index];
+	if(sideCm != nil) *sideCm = profile.sideCm;
+	if(forwardCm != nil) *forwardCm = profile.forwardCm;
+	if(heightCm != nil) *heightCm = profile.heightCm;
+}
+
+bool
+androidgame::VrCutsceneCameraAnchorCalibrationActive(void)
+{
+	return gCutsceneCameraAnchorCalibrationActive;
+}
+
+bool
+androidgame::VrStartCutsceneCameraAnchorCalibration(void)
+{
+	if(gCutsceneCameraAnchorCalibrationActive)
+		return true;
+	CEntity *actor = gCutsceneCameraActor;
+	if(actor == nil){
+		ALOG("cutscene camera calibration unavailable: camera is not using an animated actor head");
+		return false;
+	}
+	LoadCutsceneCameraAnchorProfiles();
+	if(!gCutsceneCameraAnchorProfilesLoaded){
+		ALOG("cutscene camera calibration unavailable: Quest storage is not ready");
+		return false;
+	}
+	const int modelIndex = actor->GetModelIndex();
+	char modelName[48];
+	GetCutsceneCameraModelKey(modelIndex, modelName, sizeof(modelName));
+	const int index = FindCutsceneCameraAnchorProfile(modelName,
+		modelIndex, true);
+	if(index < 0){
+		ALOGE("cutscene camera calibration profile table is full");
+		return false;
+	}
+	CutsceneCameraAnchorProfile &profile =
+		gCutsceneCameraAnchorProfiles[index];
+	gCutsceneCameraAnchorCalibrationProfile = index;
+	gCutsceneCameraAnchorCalibrationModel = modelIndex;
+	snprintf(gCutsceneCameraAnchorCalibrationName,
+		sizeof(gCutsceneCameraAnchorCalibrationName), "%s", modelName);
+	gCutsceneCameraAnchorOriginalSideCm = profile.sideCm;
+	gCutsceneCameraAnchorOriginalForwardCm = profile.forwardCm;
+	gCutsceneCameraAnchorOriginalHeightCm = profile.heightCm;
+	gCutsceneCameraAnchorCalibrationActive = true;
+	ALOG("cutscene camera calibration started: model=%s index=%d offsets side=%.2fcm forward=%.2fcm height=%.2fcm",
+		modelName, modelIndex, profile.sideCm, profile.forwardCm,
+		profile.heightCm);
+	return true;
+}
+
+void
+androidgame::VrAdjustCutsceneCameraAnchor(float sideCm,
+	float forwardCm, float heightCm)
+{
+	if(!gCutsceneCameraAnchorCalibrationActive ||
+	   gCutsceneCameraAnchorCalibrationProfile < 0 ||
+	   gCutsceneCameraAnchorCalibrationProfile >=
+		gCutsceneCameraAnchorProfileCount)
+		return;
+	CutsceneCameraAnchorProfile &profile =
+		gCutsceneCameraAnchorProfiles[gCutsceneCameraAnchorCalibrationProfile];
+	profile.sideCm = clamp(profile.sideCm+sideCm, -50.0f, 50.0f);
+	profile.forwardCm = clamp(profile.forwardCm+forwardCm, -50.0f, 50.0f);
+	profile.heightCm = clamp(profile.heightCm+heightCm, -50.0f, 50.0f);
+}
+
+bool
+androidgame::VrSaveCutsceneCameraAnchorCalibration(void)
+{
+	if(!gCutsceneCameraAnchorCalibrationActive)
+		return false;
+	if(!SaveCutsceneCameraAnchorProfiles())
+		return false; // keep calibration open so the player can retry
+	gCutsceneCameraAnchorCalibrationActive = false;
+	ALOG("cutscene camera calibration saved: model=%s index=%d side=%.2fcm forward=%.2fcm height=%.2fcm",
+		gCutsceneCameraAnchorCalibrationName,
+		gCutsceneCameraAnchorCalibrationModel,
+		gCutsceneCameraAnchorProfiles[gCutsceneCameraAnchorCalibrationProfile].sideCm,
+		gCutsceneCameraAnchorProfiles[gCutsceneCameraAnchorCalibrationProfile].forwardCm,
+		gCutsceneCameraAnchorProfiles[gCutsceneCameraAnchorCalibrationProfile].heightCm);
+	return true;
+}
+
+void
+androidgame::VrCancelCutsceneCameraAnchorCalibration(void)
+{
+	if(!gCutsceneCameraAnchorCalibrationActive)
+		return;
+	if(gCutsceneCameraAnchorCalibrationProfile >= 0 &&
+	   gCutsceneCameraAnchorCalibrationProfile <
+		gCutsceneCameraAnchorProfileCount){
+		CutsceneCameraAnchorProfile &profile =
+			gCutsceneCameraAnchorProfiles[gCutsceneCameraAnchorCalibrationProfile];
+		profile.sideCm = gCutsceneCameraAnchorOriginalSideCm;
+		profile.forwardCm = gCutsceneCameraAnchorOriginalForwardCm;
+		profile.heightCm = gCutsceneCameraAnchorOriginalHeightCm;
+	}
+	ALOG("cutscene camera calibration cancelled: model=%s", gCutsceneCameraAnchorCalibrationName);
+	gCutsceneCameraAnchorCalibrationActive = false;
+}
+
+void
+androidgame::VrGetCutsceneCameraAnchorCalibrationStatus(char *modelName,
+	int modelNameSize, float *sideCm, float *forwardCm, float *heightCm,
+	int *modelIndex)
+{
+	if(modelName != nil && modelNameSize > 0)
+		snprintf(modelName, modelNameSize, "%s",
+			gCutsceneCameraAnchorCalibrationActive ?
+			gCutsceneCameraAnchorCalibrationName : "NONE");
+	if(sideCm != nil) *sideCm = 0.0f;
+	if(forwardCm != nil) *forwardCm = 0.0f;
+	if(heightCm != nil) *heightCm = 0.0f;
+	if(modelIndex != nil) *modelIndex = -1;
+	if(!gCutsceneCameraAnchorCalibrationActive ||
+	   gCutsceneCameraAnchorCalibrationProfile < 0 ||
+	   gCutsceneCameraAnchorCalibrationProfile >=
+		gCutsceneCameraAnchorProfileCount)
+		return;
+	const CutsceneCameraAnchorProfile &profile =
+		gCutsceneCameraAnchorProfiles[gCutsceneCameraAnchorCalibrationProfile];
+	if(sideCm != nil) *sideCm = profile.sideCm;
+	if(forwardCm != nil) *forwardCm = profile.forwardCm;
+	if(heightCm != nil) *heightCm = profile.heightCm;
+	if(modelIndex != nil) *modelIndex = gCutsceneCameraAnchorCalibrationModel;
+}
 
 // The view the eyes actually use, written into the RenderWare camera so
 // everything that projects against it lands where the player is looking:
@@ -832,6 +1358,33 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		 playerVehicleState == PED_STEAL_CAR ||
 		 playerVehicleState == PED_EXIT_CAR ||
 		 playerVehicleState == PED_DRAG_FROM_CAR);
+	VrBodyIK::SetVehicleTransition(vehicleTransition);
+
+	// Body IK owns cached model-space torso/shoulder/arm references. Entering a
+	// vehicle can replace/repose Tommy without the on-foot PreRender path ever
+	// running, so reset from this always-running VR state seam instead.
+	// Reset once when vehicle ownership starts, and once again when Tommy is
+	// fully back on foot. Baked wrist calibration is restored by VrBodyIK on
+	// the next on-foot frame.
+	static CPlayerPed *ikVehicleStatePlayer;
+	static bool ikVehicleStateValid;
+	static bool ikVehicleOwned;
+	if(ikVehicleStatePlayer != player){
+		ikVehicleStatePlayer = player;
+		ikVehicleStateValid = false;
+	}
+	const bool vehicleOwnsIkState =
+		player != nil && (player->InVehicle() || vehicleTransition);
+	if(!ikVehicleStateValid){
+		ikVehicleOwned = vehicleOwnsIkState;
+		ikVehicleStateValid = true;
+	}else if(ikVehicleOwned != vehicleOwnsIkState){
+		ikVehicleOwned = vehicleOwnsIkState;
+		VrBodyIK::ResetVehicleTransition();
+		ALOG("[IK] vehicle transition reset: %s",
+			ikVehicleOwned ? "ENTER/VEHICLE" : "RETURN_ON_FOOT");
+	}
+
 	// THIRD PERSON vehicle view: leave the immersive seat entirely and let
 	// the stock chase camera drive the stereo view, the same way the RC
 	// missions already play. Everything downstream follows: the animated
@@ -890,9 +1443,18 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 // looks back at Tommy. Hiding him then plays the shot over empty
 // pavement, so he is drawn from the blow that kills him.
 #ifdef GTA_VR_WEAPONS
-	gVrHidePlayerBody = !thirdPersonVehicle &&
-		(!gVrInVehicle || OculusVR::IsImmersiveDrivingActive()) &&
-		!(player != nil && player->DyingOrDead());
+	// On foot the real Tommy skeleton is now the VR body: keep it visible so
+	// VrBodyIK can drive the arms beneath the existing tracked hand meshes.
+	// Immersive/motion vehicle modes still use the historical hands-only policy.
+	// OFF = shipped hands-only presentation. ON = real skinned Tommy body on foot.
+	// Vehicle ownership remains unchanged.
+	const bool vehicleBodyIK =
+		gVrInVehicle && androidgame::VrVehicleBodyIKEnabled();
+	gVrHidePlayerBody =
+		(!gVrInVehicle && !androidgame::VrBodyIKEnabled()) ||
+		(!thirdPersonVehicle && gVrInVehicle &&
+		 OculusVR::IsImmersiveDrivingActive() && !vehicleBodyIK &&
+		 !(player != nil && player->DyingOrDead()));
 #else
 	gVrHidePlayerBody = true;
 #endif
@@ -904,13 +1466,20 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 	// nothing reinvented. During death/respawn, or when the clump is gone,
 	// the regular game camera takes over, exactly as the desktop does.
 	if(wantFirstPerson && player->m_rwObject != nil &&
-	   !player->DyingOrDead() && player->m_pFrames[PED_HEAD] != nil){
-		CVector forward = player->GetForward();
+	   !player->DyingOrDead() && player->m_pFrames[PED_HEAD] != nil &&
+	   (player->InVehicle() || player->m_pFrames[PED_NECK] != nil)){
+		CVector animatedTransitionHead;
+		CVector animatedTransitionForward;
+		const bool animatedTransitionPose = !gVrInVehicle &&
+			vehicleTransition && GetAnimatedPedHeadPose(
+				player, &animatedTransitionHead,
+				&animatedTransitionForward);
+		CVector forward = animatedTransitionPose ?
+			animatedTransitionForward : player->GetForward();
 		forward.Normalise();
-		// Head modes turn the hidden ped into the movement direction, so
-		// anchoring the VR frame on his body would rotate the world a second
-		// time and curve the walk away. Use the gameplay camera, as the
-		// desktop build does.
+		// During a car-door/carjack task the native head animation owns the base
+		// heading. Keep the controller/head-relative movement modes out of this
+		// short sequence so the camera follows Tommy's actual animated pose.
 		const bool headModeOnFoot = !gVrInVehicle && !thirdPersonVehicle &&
 			!vehicleTransition &&
 			(androidgame::VrUsesHeadRelativeMovement() ||
@@ -946,47 +1515,123 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		}
 
 		CVector head(0.0f, 0.0f, 0.0f);
-		if(!gVrInVehicle && !androidgame::VrHeadBobbingEnabled() &&
-		   !player->bIsDucking){
-			// 0.4.1 PC parity: hold a stable eye height while walking. 0.59m
-			// matches reVC's established first-person no-bob anchor.
-			CVector up = player->GetUp();
-			up.Normalise();
-			head = player->GetPosition()+up*0.59f;
-		}else
+		if(!gVrInVehicle){
+			if(animatedTransitionPose){
+				// Door opening, carjacking and entering use the original authored
+				// head/neck motion. Anchor to that live skinned head, not the stable
+				// standing neck latch, which intentionally suppresses animation bob.
+				head = animatedTransitionHead + CVector(0.0f, 0.0f, 0.040f);
+			}else{
+				// Stable ordinary on-foot camera: latch the real neck relative to
+				// Tommy's root to keep locomotion bob out of the HMD. Native vehicle
+				// interaction animations above deliberately bypass this stabilization.
+				static CPlayerPed *neckAnchorPlayer;
+				static CVector neckLocal;
+				static bool neckLatched;
+				if(neckAnchorPlayer != player){
+					neckAnchorPlayer = player;
+					neckLatched = false;
+				}
+
+				CVector right = player->GetRight();
+				CVector up = player->GetUp();
+				CVector bodyForward = player->GetForward();
+				right.Normalise();
+				up.Normalise();
+				bodyForward.Normalise();
+
+				const CVector neckNow = player->GetNodePosition(PED_NECK);
+				const CVector delta = neckNow-player->GetPosition();
+				const CVector candidate(
+					DotProduct(delta, right),
+					DotProduct(delta, bodyForward),
+					DotProduct(delta, up));
+
+				if(!neckLatched &&
+				   Abs(candidate.x) < 0.60f &&
+				   Abs(candidate.y) < 0.60f &&
+				   candidate.z > 0.20f && candidate.z < 1.50f){
+					neckLocal = candidate;
+					neckLatched = true;
+				}
+
+				if(player->bIsDucking){
+					// Crouching also follows the live native animated neck.
+					head = neckNow+
+						bodyForward*0.060f+
+						up*0.220f;
+				}else if(neckLatched){
+					head = player->GetPosition()+
+						right*neckLocal.x+
+						bodyForward*(neckLocal.y+0.060f)+
+						up*(neckLocal.z+0.220f);
+				}else{
+					head = neckNow+
+						bodyForward*0.060f+
+						up*0.220f;
+				}
+			}
+		}else{
 			player->m_pedIK.GetComponentPosition(head, PED_HEAD);
+		}
 		if(gVrInVehicle && player->m_pMyVehicle->IsBike()){
-			// The riding animation moves this bone every frame, and on a bike
-			// it moves a long way: the eye ends up shaken by the animation on
-			// top of the road. Take the bone once, in the bike's own frame,
-			// and rebuild the seat from the bike matrix after that, so the
-			// only motion left is the bike's.
 			static CVehicle *seatVehicle;
 			static CVector seatLocal;
 			static bool seatLatched;
+			static bool seatBodyIKMode;
 			CVehicle *bike = player->m_pMyVehicle;
-			if(seatVehicle != bike){
+
+#ifdef GTA_VR_WEAPONS
+			const bool bikeBodyIK = VrBodyIK::VehicleEnabled();
+#else
+			const bool bikeBodyIK = false;
+#endif
+
+			if(seatVehicle != bike || seatBodyIKMode != bikeBodyIK){
 				seatVehicle = bike;
+				seatBodyIKMode = bikeBodyIK;
 				seatLatched = false;
 			}
-			const CVector delta = head-bike->GetPosition();
-			const CVector candidate(
-				DotProduct(delta, bike->GetRight()),
-				DotProduct(delta, bike->GetForward()),
-				DotProduct(delta, bike->GetUp()));
-			// Refuse a bone caught mid mount or dismount: it sits well away
-			// from the saddle and would latch the whole ride to the kerb.
-			if(!seatLatched && Abs(candidate.x) < 1.2f &&
-			   Abs(candidate.y) < 2.5f &&
-			   candidate.z > -0.5f && candidate.z < 2.5f){
-				seatLocal = candidate;
-				seatLatched = true;
+
+			if(bikeBodyIK){
+				// TRUE attachment: ask Body IK for the exact neck anchor it
+				// derived from the same transformed skeleton the renderer uses.
+				// No second local-space reconstruction exists in camera code.
+				CVector stableNeck;
+				if(VrBodyIK::GetVehicleNeckWorld(player, &stableNeck)){
+					head = stableNeck+
+						bike->GetForward()*0.060f+
+						bike->GetUp()*0.180f;
+				}else{
+					// First-frame fallback before the body solver has published
+					// its motorcycle neck. Never add lateral correction.
+					head = player->GetNodePosition(PED_NECK)+
+						bike->GetForward()*0.060f+
+						bike->GetUp()*0.180f;
+				}
+			}else{
+				// Historical non-IK motorcycle path: latch PED_HEAD directly
+				// in motorcycle space.
+				const CVector delta = head-bike->GetPosition();
+				const CVector candidate(
+					DotProduct(delta, bike->GetRight()),
+					DotProduct(delta, bike->GetForward()),
+					DotProduct(delta, bike->GetUp()));
+
+				if(!seatLatched && Abs(candidate.x) < 1.2f &&
+				   Abs(candidate.y) < 2.5f &&
+				   candidate.z > -0.5f && candidate.z < 2.5f){
+					seatLocal = candidate;
+					seatLatched = true;
+				}
+
+				if(seatLatched)
+					head =
+						bike->GetPosition()+
+						bike->GetRight()*seatLocal.x+
+						bike->GetForward()*seatLocal.y+
+						bike->GetUp()*seatLocal.z;
 			}
-			if(seatLatched)
-				head = bike->GetPosition()+
-					bike->GetRight()*seatLocal.x+
-					bike->GetForward()*seatLocal.y+
-					bike->GetUp()*seatLocal.z;
 		}
 		CVector nudge = forward;
 		if(headModeOnFoot){
@@ -1004,7 +1649,23 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 				nudge = CVector(vrForward[0], vrForward[1],
 					vrForward[2]);
 		}
-		head += nudge * 0.12f;
+		if(gVrInVehicle){
+#ifdef GTA_VR_WEAPONS
+			const bool exactBikeNeckCamera =
+				player->m_pMyVehicle != nil &&
+				player->m_pMyVehicle->IsBike() &&
+				VrBodyIK::VehicleEnabled();
+#else
+			const bool exactBikeNeckCamera = false;
+#endif
+			// Motorcycle Sitting Body IK already places the eye directly from
+			// the same transformed neck used by the visible body. Do not apply
+			// the old generic 12 cm vehicle nudge afterward; depending on the
+			// current view basis it was pushing the camera sideways/back away
+			// from the neck.
+			if(!exactBikeNeckCamera)
+				head += nudge * 0.12f;
+		}
 		if(thirdPersonVehicle){
 			// Ride the stock chase camera instead of a seat: its position
 			// and heading, but through the first-person machinery, so the
@@ -1021,14 +1682,21 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		}
 #ifdef GTA_VR_WEAPONS
 		if(gVrInVehicle){
-			// The desktop vehicle view applies both the global vertical seat
-			// adjustment and the per-model fore/aft calibration before the
-			// OpenXR eye pose. Quest anchors directly on the animated head
-			// bone, so fold the same offsets into that anchor here.
-			CMatrix vehicleView = player->GetMatrix();
-			vehicleView.GetPosition() = head;
-			OculusVR::ApplyQuestVehicleViewOffset(&vehicleView);
-			head = vehicleView.GetPosition();
+			const bool lockedBikeBodyCamera =
+				player->m_pMyVehicle != nil &&
+				player->m_pMyVehicle->IsBike() &&
+				VrBodyIK::VehicleEnabled();
+
+			// The motorcycle Body IK camera is already built directly from the
+			// visible neck in the bike frame. Do NOT run the generic vehicle
+			// seat calibration afterward; it can vertically/fore-aft shift the
+			// eye away from that visible neck again.
+			if(!lockedBikeBodyCamera){
+				CMatrix vehicleView = player->GetMatrix();
+				vehicleView.GetPosition() = head;
+				OculusVR::ApplyQuestVehicleViewOffset(&vehicleView);
+				head = vehicleView.GetPosition();
+			}
 		}
 #endif
 
@@ -1043,10 +1711,13 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			// pitch over hills/wheelies) and replaces only its rolled up vector
 			// with world-up. Feeding both through the same basis API also keeps
 			// controller/hand conversion consistent with the rendered eyes.
-			const bool levelBikeView = viewVehicle->IsBike() &&
+			const bool bikeBodyCamera =
+				viewVehicle->IsBike() && VrBodyIK::VehicleEnabled();
+			const bool levelBikeView =
+				viewVehicle->IsBike() && !bikeBodyCamera &&
 				!OculusVR::IsQuestBikeViewFollowingTilt();
 			CVector vehicleUp =
-				viewVehicle->IsBike() &&
+				viewVehicle->IsBike() && !bikeBodyCamera &&
 			 (levelBikeView || OculusVR::IsQuestBikeHorizonLocked()) ?
 				CVector(0.0f, 0.0f, 1.0f) :
 				viewVehicle->GetUp();
@@ -1080,9 +1751,16 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			}
 		}
 #endif
-		if(!fullVehicleBasis)
+		if(!fullVehicleBasis){
+			if(!gVrInVehicle){
+				gVrOnFootBodyAnchor = head;
+				gVrOnFootBodyAnchorValid = true;
+			}else{
+				gVrOnFootBodyAnchorValid = false;
+			}
 			rw::vulkan::setFirstPersonAnchor(&head.x,
 				Atan2(forward.y, forward.x), 1, 1);
+		}
 
 #ifdef GTA_VR_WEAPONS
 		// CapturePad converts controller poses before physics so interactions
@@ -1109,10 +1787,34 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 			forward = CVector(0.0f, 1.0f, 0.0f);
 		forward.Normalise();
 		CVector head = TheCamera.GetPosition();
-		CVector actorHead, actorForward;
-		if(GetCutsceneActorHead(androidgame::VrCutsceneCamera(),
-		  &actorHead, &actorForward)){
-			head = actorHead;
+		const CVector directorPosition = head;
+		CVector actorHead(0.0f, 0.0f, 0.0f), actorForward;
+		bool usingTommyHead = false;
+		bool usingSelectedActorHead = false;
+
+		// First-person stereo cutscene policy:
+		// If Tommy participates in the scene, ride the NATIVE animated Tommy
+		// head. Body IK is explicitly disabled during the sequence, so the
+		// entire authored animation plays untouched beneath the camera.
+		//
+		// If Tommy is not present, preserve the existing remembered actor /
+		// director selection as the fallback.
+		usingTommyHead = GetTommyCutsceneHead(&actorHead, &actorForward);
+		if(!usingTommyHead)
+			usingSelectedActorHead = GetCutsceneActorHead(
+				androidgame::VrCutsceneCamera(), &actorHead, &actorForward);
+		if(usingTommyHead || usingSelectedActorHead){
+			// Exact model profiles win. Unknown model names inherit the existing
+			// PLAYER or CSPLAY configuration according to actor role, so future
+			// replacements keep the calibrated framing instead of using only 4 cm.
+			float sideCm = 0.0f, forwardCm = 0.0f, heightCm = 0.0f;
+			GetCutsceneCameraAnchorOffset(gCutsceneCameraActor,
+				&sideCm, &forwardCm, &heightCm);
+			const CVector right(actorForward.y, -actorForward.x, 0.0f);
+			head = actorHead + CVector(0.0f, 0.0f,
+				0.040f + heightCm*0.01f) +
+				right*(sideCm*0.01f) +
+				actorForward*(forwardCm*0.01f);
 			forward = actorForward;
 		}
 		rw::vulkan::setFirstPersonAnchor(&head.x,
@@ -1120,6 +1822,7 @@ VrUpdateFirstPersonAnchor(bool postPhysics)
 		if(postPhysics)
 			SyncRenderWareCameraToVrView();
 	}else{
+		gVrOnFootBodyAnchorValid = false;
 		rw::vulkan::setFirstPersonAnchor(nil, 0.0f, 0, 0);
 	}
 }

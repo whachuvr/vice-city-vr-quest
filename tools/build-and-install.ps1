@@ -442,6 +442,25 @@ try {
         throw "Quest source assembly failed."
     }
 
+    # CMake/Ninja compares configure-input mtimes against build.ninja. The
+    # private tree is assembled with robocopy, which preserves source mtimes;
+    # if any project CMake file carries a clock-skewed/future timestamp (or a
+    # timestamp within the filesystem precision window), Ninja can repeatedly
+    # regenerate CMake until it aborts with:
+    #   manifest 'build.ninja' still dirty after 100 tries
+    # Normalize only project-side configure inputs in this freshly-created
+    # private build tree. Contents are unchanged and generated/object files do
+    # not exist yet, so this does not turn a full build into a clean/rebuild
+    # workaround and does not touch the checked-out source repository.
+    Write-Host "Normalizing project CMake timestamps for deterministic Ninja configure..."
+    $safeCmakeTime = (Get-Date).AddMinutes(-2)
+    $cmakeInputs = @(Get-ChildItem -LiteralPath $assembledDir -Recurse -File -ErrorAction Stop |
+        Where-Object { $_.Name -eq "CMakeLists.txt" -or $_.Extension -eq ".cmake" })
+    foreach ($cmakeInput in $cmakeInputs) {
+        $cmakeInput.LastWriteTime = $safeCmakeTime
+    }
+    Write-Host ("  normalized {0} project CMake input(s) to {1}" -f $cmakeInputs.Count, $safeCmakeTime.ToString("yyyy-MM-dd HH:mm:ss"))
+
     Write-Step 5 "Preparing verified Gradle $gradleVersion"
     $downloadsDir = Join-Path $resolvedWork ".downloads"
     $toolsDir = Join-Path $resolvedWork ".tools"

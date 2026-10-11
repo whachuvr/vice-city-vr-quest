@@ -98,6 +98,9 @@ bool IsPhysicalWeaponInteractionActive();
 bool IsQuestFirstPersonOnFoot();
 bool IsTrackedWeaponHeld(int hand);
 int GetHeldWeaponSlot(int hand);
+// Applies the baked position-only LEFT-hand weapon correction selected from
+// the player's final completed calibration. There is no runtime calibration mode.
+void ApplyBakedLeftWeaponPositionToMatrix(int hand, CMatrix *matrix);
 bool IsRunWithoutLimitsEnabled();
 void SetRunWithoutLimitsEnabled(bool enabled);
 void SetTrackedWeaponRenderMatrix(int hand, int slot, int weaponType,
@@ -132,6 +135,11 @@ bool GetTrackedHandAimRay(int hand, CVector *origin, CVector *direction);
 #ifdef GTA_VR_WEAPONS
 bool GetTrackedVisualHandMatrix(int hand, CMatrix *handMatrix,
 	float *grip = nil, float *trigger = nil);
+// Replaces only an active two-handed weapon's support-hand presentation pose
+// with the exact weapon support socket. Unlike GetTrackedVisualHandMatrix(),
+// this does not apply wheel or steering presentation offsets.
+bool ApplyTrackedWeaponSupportHandLock(int hand, CMatrix *handMatrix,
+	bool useCurrentWeaponSocket = false);
 bool GetTrackedVisualHandAimRay(int hand, CVector *origin,
 	CVector *direction);
 #endif
@@ -172,6 +180,11 @@ bool GetImmersiveBikeHandleMatrix(int hand, CMatrix *matrix);
 bool IsImmersiveBikeHandleGrabbed(int hand);
 bool ShouldRenderImmersiveBikeHandleMarker(int hand);
 bool GetImmersiveSteeringHandleMatrix(int hand, CMatrix *matrix);
+// Returns only the actual steering rotation applied to the grabbed
+// vehicle control, without exporting the control socket's absolute
+// pitch/yaw/roll wrist basis.
+bool GetQuestVehicleHandSteerRotation(int hand, CVector *axis,
+	float *angle);
 bool IsImmersiveSteeringHandleGrabbed(int hand);
 bool ShouldRenderImmersiveSteeringHandleMarker(int hand);
 #if defined(GTA_VR_WEAPONS) && defined(__ANDROID__)

@@ -184,6 +184,18 @@ int VrCutsceneCamera(void);
 void *VrCutsceneCameraActor(void);
 // The director camera plus one per staged head.
 int VrCutsceneCameraCount(void);
+// Per-model cutscene camera-anchor calibration. Press L3+R3 during a stereo
+// cutscene to enter/exit. While active, the sticks nudge the selected model's
+// anchor; A saves to app storage and B cancels. Offsets are centimetres in the
+// actor-local horizontal frame and are reused for that model in future scenes.
+bool VrCutsceneCameraAnchorCalibrationActive(void);
+bool VrStartCutsceneCameraAnchorCalibration(void);
+void VrAdjustCutsceneCameraAnchor(float sideCm, float forwardCm, float heightCm);
+bool VrSaveCutsceneCameraAnchorCalibration(void);
+void VrCancelCutsceneCameraAnchorCalibration(void);
+void VrGetCutsceneCameraAnchorCalibrationStatus(char *modelName,
+    int modelNameSize, float *sideCm, float *forwardCm, float *heightCm,
+    int *modelIndex);
 int VrSpatialAaMode(void);
 // Wrist panels: the minimap and the money/health/wanted readout, each on its
 // own arm. Index with the WRIST_PANEL_* values from librw's rwvk.h.
@@ -231,6 +243,11 @@ bool VrUsesHeadRelativeMovement(void);
 // HEAD DIRECTED only: Tommy is reoriented onto the movement direction.
 bool VrUsesHeadDirectedMovement(void);
 bool VrHeadBobbingEnabled(void);
+// Full-body IK is opt-in; OFF preserves the shipped floating hands.
+bool VrBodyIKEnabled(void);
+// Separate vehicle option: keep the native seated lower body/torso and solve
+// the skinned arms to the same final vehicle hand poses used by floating hands.
+bool VrVehicleBodyIKEnabled(void);
 bool VrUsesExperimentalHeadTurning(void);
 float VrHeadTurnScale(void);
 bool VrUsesSnapTurn(void);
@@ -250,6 +267,9 @@ bool VrShouldUseTheaterMode(void);
 // of the stick. Any pointer may be nil. False when the game camera is the view.
 bool VrGetViewBasis(float position[3], float right[3], float up[3],
                     float forward[3]);
+// Exact on-foot world anchor submitted to librw::setFirstPersonAnchor.
+// Body IK uses this to measure room-scale without reconstructing offsets.
+bool VrGetOnFootBodyAnchor(float position[3]);
 
 // Latch the pose being held now as the neutral one. A player who started
 // seated and then stood up is riding an eye height taken while seated until
@@ -261,6 +281,7 @@ void VrRecenterView(void);
 // instead; the CONTROLS page hands either behaviour back.
 bool VrStickLookBehindEnabled(void);
 bool VrStickCrouchEnabled(void);
+bool VrCrouchJustDown(void);
 float VrTheaterAspectRatio(void);
 
 // One iteration of the game's gGameState machine, including rsIDLE. Must be

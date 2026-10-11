@@ -220,6 +220,12 @@ if(NOT MIAMIVR_BRINGUP)
 		"${REVC_ROOT}/src/vr/VRHandModel.cpp"
 		"${REVC_ROOT}/src/vr/QuestDrivingVR.cpp"
 		"${REVC_ROOT}/src/vr/QuestWeaponVR.cpp")
+	# Player full-body presentation IK is intentionally isolated from the
+	# weapon module. Keep it explicit so incremental Ninja graphs notice the
+	# newly introduced translation unit after CMake reruns.
+	set(VR_BODY_IK_SOURCE "${REVC_ROOT}/src/peds/VrBodyIK.cpp")
+	list(REMOVE_ITEM GAME_SOURCES "${VR_BODY_IK_SOURCE}")
+	list(APPEND GAME_SOURCES "${VR_BODY_IK_SOURCE}")
 
 	list(APPEND MIAMIVR_SOURCES ${GAME_SOURCES})
 
